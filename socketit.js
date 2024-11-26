@@ -1,6 +1,45 @@
+const https = require('https');
+const fs = require('fs');
+const forge = require('node-forge');
 const WebSocket = require('ws');
-const { v4: uuidv4 } = require('uuid');
 const { EventEmitter } = require('events');
+const { v4: uuidv4 } = require('uuid');
+
+// Self-Sign Certificate Utility
+function createSelfSignedCert() {
+    const pki = forge.pki;
+
+    // Generate a keypair
+    const keys = pki.rsa.generateKeyPair(2048);
+
+    // Create a self-signed certificate
+    const cert = pki.createCertificate();
+    cert.publicKey = keys.publicKey;
+    cert.serialNumber = '01';
+    cert.validity.notBefore = new Date();
+    cert.validity.notAfter = new Date();
+    cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 1); // 1 year validity
+
+    const attrs = [
+        { name: 'commonName', value: 'localhost' },
+        { name: 'countryName', value: 'US' },
+        { shortName: 'ST', value: 'California' },
+        { name: 'localityName', value: 'San Francisco' },
+        { name: 'organizationName', value: 'Test Company' },
+        { shortName: 'OU', value: 'Test Division' },
+    ];
+    cert.setSubject(attrs);
+    cert.setIssuer(attrs);
+
+    // Self-sign the certificate
+    cert.sign(keys.privateKey, forge.md.sha256.create());
+
+    // Convert to PEM format
+    const certPem = pki.certificateToPem(cert);
+    const keyPem = pki.privateKeyToPem(keys.privateKey);
+
+    return { cert: certPem, key: keyPem };
+}
 
 class Channel extends EventEmitter {
     constructor(ws, options = {}) {
@@ -38,12 +77,12 @@ class Channel extends EventEmitter {
     }
 
     _onClose(code, reason) {
-        this.ws.removeAllListeners(); // Clean up all listeners on error
+        this.ws.removeAllListeners();
         this.emit('disconnected', code, reason);
     }
 
     _onError(error) {
-        this.ws.removeAllListeners(); // Clean up all listeners on error
+        this.ws.removeAllListeners();
         this.emit('error', error);
     }
 
@@ -83,27 +122,21 @@ class Channel extends EventEmitter {
                     }
                 } catch (err) {
                     if (message.type === 'request') {
-                        try {
-                            this._send({
-                                type: 'response',
-                                ack: id,
-                                code: 500,
-                                data: {message: err.message},
-                            });
-                        } catch(err){
-                            console.error('Failed to send error response: 500', err);
-                        }
+                        this._send({
+                            type: 'response',
+                            ack: id,
+                            code: 500,
+                            data: { message: err.message },
+                        });
                     }
                 }
-            } else {
-                if (message.type === 'request') {
-                    this._send({
-                        type: 'response',
-                        ack: id,
-                        code: 404,
-                        data: { message: `Method '${method}' not found` },
-                    });
-                }
+            } else if (message.type === 'request') {
+                this._send({
+                    type: 'response',
+                    ack: id,
+                    code: 404,
+                    data: { message: `Method '${method}' not found` },
+                });
             }
         }
     }
@@ -171,39 +204,76 @@ class Server extends EventEmitter {
         super();
         this.options = {
             port: 8080,
+            tls: false,
+            cert: null,
+            key: null,
+            ca: null,
+            externalServer: null,
+            perMessageDeflate: true,
             ...options,
         };
-        this.routes = {
-            ...this.options.routes,
-        };
+        this.routes = { ...this.options.routes };
         this.channels = new Set();
+        this.server = null;
         this.wss = null;
+    }
+
+    _createSecureServer() {
+        let cert, key;
+        if (this.options.cert && this.options.key) {
+            cert = fs.readFileSync(this.options.cert);
+            key = fs.readFileSync(this.options.key);
+        } else {
+            console.warn('No cert/key provided. Generating self-signed certificate...');
+            const selfSigned = createSelfSignedCert();
+            cert = selfSigned.cert;
+            key = selfSigned.key;
+        }
+
+        const options = { cert, key };
+        if (this.options.ca) {
+            options.ca = fs.readFileSync(this.options.ca);
+        }
+
+        return https.createServer(options);
     }
 
     start() {
         return new Promise((resolve, reject) => {
-            this.wss = new WebSocket.Server({ port: this.options.port });
+            try {
+                if (this.options.externalServer) {
+                    this.server = this.options.externalServer;
+                } else if (this.options.tls) {
+                    this.server = this._createSecureServer();
+                } else {
+                    this.server = require('http').createServer();
+                }
 
-            this.wss.on('connection', (ws, req) => {
-                const channel = new Channel(ws, { routes: this.routes });
-                this.channels.add(channel);
+                this.wss = new WebSocket.Server({ server: this.server, perMessageDeflate: this.options.perMessageDeflate });
 
-                channel.on('disconnected', () => {
-                    this.channels.delete(channel);
+                this.wss.on('connection', (ws, req) => {
+                    const channel = new Channel(ws, { routes: this.routes });
+                    this.channels.add(channel);
+
+                    channel.on('disconnected', () => {
+                        this.channels.delete(channel);
+                    });
+
+                    this.emit('connection', channel, req);
                 });
 
-                this.emit('connection', channel, req);
-            });
+                this.server.listen(this.options.port, () => {
+                    this.emit('listening', this.options.port);
+                    resolve();
+                });
 
-            this.wss.on('listening', () => {
-                this.emit('listening', this.options.port);
-                resolve();
-            });
-
-            this.wss.on('error', (err) => {
-                this.emit('error', err);
-                reject(err);
-            });
+                this.server.on('error', (err) => {
+                    this.emit('error', err);
+                    reject(err);
+                });
+            } catch (error) {
+                reject(error);
+            }
         });
     }
 
@@ -211,8 +281,12 @@ class Server extends EventEmitter {
         return new Promise((resolve, reject) => {
             if (this.wss) {
                 this.wss.close((err) => {
-                    if (err) {
-                        reject(err);
+                    if (err) return reject(err);
+                    if (this.server) {
+                        this.server.close((serverErr) => {
+                            if (serverErr) return reject(serverErr);
+                            resolve();
+                        });
                     } else {
                         resolve();
                     }
@@ -233,20 +307,25 @@ class Client extends EventEmitter {
             reconnectInterval: 5000,
             pingInterval: 10000,
             routes: {},
+            rejectUnauthorized: true,
+            perMessageDeflate: true,
             ...options,
         };
         this.ws = null;
         this.channel = null;
         this.pingIntervalId = null;
+        this._manualClose = false; // Track if close was called manually
         this._connect();
     }
 
     _connect() {
         this.ws = new WebSocket(this.url, {
-            rejectUnauthorized: this.options.rejectUnauthorized || false,
+            rejectUnauthorized: this.options.rejectUnauthorized,
+            perMessageDeflate: this.options.perMessageDeflate
         });
 
         this.ws.on('open', () => {
+            this._manualClose = false;
             this.channel = new Channel(this.ws, { routes: this.options.routes });
             this.channel.on('disconnected', () => this._onDisconnected());
             this.emit('connected', this.channel);
@@ -255,18 +334,13 @@ class Client extends EventEmitter {
             }
         });
 
-        this.ws.on('error', (err) => {
-            this.emit('error', err);
-        });
-
-        this.ws.on('close', () => {
-            this._onDisconnected();
-        });
+        this.ws.on('error', (err) => this.emit('error', err));
+        this.ws.on('close', () => this._onDisconnected());
     }
 
     _onDisconnected() {
         if (this.ws) {
-            this.ws.removeAllListeners(); // Clean up listeners
+            this.ws.removeAllListeners();
         }
 
         this.emit('disconnected');
@@ -274,7 +348,8 @@ class Client extends EventEmitter {
             clearInterval(this.pingIntervalId);
             this.pingIntervalId = null;
         }
-        if (this.options.autoReconnect) {
+
+        if (!this._manualClose && this.options.autoReconnect) {
             setTimeout(() => this._connect(), this.options.reconnectInterval);
         }
     }
@@ -287,15 +362,13 @@ class Client extends EventEmitter {
             if (this.channel && this.channel.isOnline) {
                 this.channel
                     .request('ping', null, { timeout: this.options.pingInterval / 2 })
-                    .catch((err) => {
-                        console.error('Ping failed:', err.message);
-                        this.ws.close();
-                    });
+                    .catch(() => this.ws.close());
             }
         }, this.options.pingInterval);
     }
 
     close() {
+        this._manualClose = true; // Indicate manual closure
         if (this.pingIntervalId) {
             clearInterval(this.pingIntervalId);
         }
@@ -305,8 +378,4 @@ class Client extends EventEmitter {
     }
 }
 
-module.exports = {
-    Server,
-    Client,
-    Channel
-};
+module.exports = { Server, Client, Channel };

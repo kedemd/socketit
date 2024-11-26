@@ -7,10 +7,12 @@
 
 ## Features
 
-- Supports **request-response** and **publish-subscribe** patterns.
+- Supports **request-response** and **publish-subscribe** patterns with `async` handlers.
 - Built-in **timeout handling** for requests.
 - Customizable **routes** for handling WebSocket messages.
 - Automatic **reconnection** for clients.
+- Built-in **TLS support** with options for self-signed certificates.
+- **Compression** with `permessage-deflate`.
 - Ping mechanism to ensure connection health.
 - Works with Node.js.
 
@@ -28,9 +30,11 @@ npm install socketit
 const { Server } = require('socketit');
 
 const server = new Server({
-    port: 8080,
+    port: 8443,
+    tls: true, // Enable TLS
     routes: {
-        echo: (data) => data, // Echoes back the received data
+        echo: async (data) => data, // Async handler to echo back data
+        reverse: async (data) => data.split('').reverse().join(''), // Reverse a string
     },
 });
 
@@ -43,7 +47,7 @@ server.on('connection', (channel) => {
 });
 
 server.start().then(() => {
-    console.log('Server is running on port 8080');
+    console.log('Server is running on port 8443 with TLS');
 });
 ```
 
@@ -52,24 +56,27 @@ server.start().then(() => {
 ```javascript
 const { Client } = require('socketit');
 
-const client = new Client('ws://localhost:8080', {
+const client = new Client('wss://localhost:8443', {
+    rejectUnauthorized: false, // Allow self-signed certificates
     routes: {
-        greeting: (data) => {
+        greeting: async (data) => {
             console.log('Server says:', data);
         },
     },
 });
 
-client.on('connected', (channel) => {
+client.on('connected', async (channel) => {
     console.log('Connected to server');
-    
-    channel.request('echo', { message: 'Hello, server!' })
-        .then((response) => {
-            console.log('Server responded:', response);
-        })
-        .catch((err) => {
-            console.error('Request failed:', err.message);
-        });
+
+    try {
+        const response = await channel.request('echo', { message: 'Hello, server!' });
+        console.log('Server responded:', response);
+
+        const reversed = await channel.request('reverse', 'Hello');
+        console.log('Reversed string:', reversed);
+    } catch (err) {
+        console.error('Request failed:', err.message);
+    }
 });
 
 client.on('disconnected', () => {
@@ -89,12 +96,17 @@ new Server(options)
 
 **Options**:
 - `port` (number): The port for the WebSocket server. Default is `8080`.
+- `tls` (boolean): Enable TLS. Default is `false`.
+- `cert` (string): Path to the TLS certificate file (optional for self-signed).
+- `key` (string): Path to the TLS private key file (optional for self-signed).
+- `ca` (string): Path to the certificate authority file (optional).
 - `routes` (object): An object defining methods to handle incoming messages. For example:
   ```javascript
   {
-      echo: (data) => data
+      echo: async (data) => data
   }
   ```
+- `perMessageDeflate` (boolean): Enable WebSocket compression. Default is `false`.
 
 #### Methods
 
@@ -115,6 +127,8 @@ new Client(url, options)
 - `url` (string): The WebSocket server URL.
 - `options` (object): Configuration options.
   - `autoReconnect` (boolean): Automatically reconnect on disconnection. Default is `true`.
+  - `rejectUnauthorized` (boolean): Allow self-signed certificates. Default is `true`.
+  - `perMessageDeflate` (boolean): Enable WebSocket compression. Default is `false`.
   - `routes` (object): An object defining methods to handle incoming messages.
 
 #### Methods
@@ -129,6 +143,7 @@ new Client(url, options)
 
 - **`.request(method, data, options)`**
   - Sends a request to the server and waits for a response.
+  - **Supports async handlers**.
   - **Parameters**:
     - `method` (string): The name of the method to call.
     - `data` (any): Data to send with the request.
