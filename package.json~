@@ -1,0 +1,35 @@
+{
+  "name": "socketit",
+  "version": "1.0.0",
+  "description": "Socketit: A simple and powerful toolkit for WebSocket communication.",
+  "main": "socketit.js",
+  "scripts": {
+    "start": "echo \"No start script specified\"",
+    "test": "echo \"No test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kedemd/sockit.git"
+  },
+  "keywords": [
+    "websocket",
+    "ws",
+    "communication",
+    "server",
+    "client",
+    "pubsub"
+  ],
+  "author": "Kedem Diamant",
+  "license": "MIT",
+  "dependencies": {
+    "uuid": "^9.0.0",
+    "ws": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "bugs": {
+    "url": "https://github.com/kedemd/sockit/issues"
+  },
+  "homepage": "https://github.com/kedemd/sockit#readme"
+}
