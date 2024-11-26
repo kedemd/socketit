@@ -9,7 +9,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/kedemd/sockit.git"
+    "url": "https://github.com/kedemd/socketit.git"
   },
   "keywords": [
     "websocket",

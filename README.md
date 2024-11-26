@@ -3,7 +3,7 @@
 
 **Socketit**: A simple and powerful toolkit for WebSocket communication.
 
-![Socketit Logo](./socketit.svg)
+![Socketit Logo](http://github.com/kedemd/socketit/raw/main/socketit.svg)
 
 ## Features
 
