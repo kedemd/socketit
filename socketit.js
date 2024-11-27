@@ -1,45 +1,8 @@
 const https = require('https');
 const fs = require('fs');
-const forge = require('node-forge');
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { v4: uuidv4 } = require('uuid');
-
-// Self-Sign Certificate Utility
-function createSelfSignedCert() {
-    const pki = forge.pki;
-
-    // Generate a keypair
-    const keys = pki.rsa.generateKeyPair(2048);
-
-    // Create a self-signed certificate
-    const cert = pki.createCertificate();
-    cert.publicKey = keys.publicKey;
-    cert.serialNumber = '01';
-    cert.validity.notBefore = new Date();
-    cert.validity.notAfter = new Date();
-    cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 1); // 1 year validity
-
-    const attrs = [
-        { name: 'commonName', value: 'localhost' },
-        { name: 'countryName', value: 'US' },
-        { shortName: 'ST', value: 'California' },
-        { name: 'localityName', value: 'San Francisco' },
-        { name: 'organizationName', value: 'Test Company' },
-        { shortName: 'OU', value: 'Test Division' },
-    ];
-    cert.setSubject(attrs);
-    cert.setIssuer(attrs);
-
-    // Self-sign the certificate
-    cert.sign(keys.privateKey, forge.md.sha256.create());
-
-    // Convert to PEM format
-    const certPem = pki.certificateToPem(cert);
-    const keyPem = pki.privateKeyToPem(keys.privateKey);
-
-    return { cert: certPem, key: keyPem };
-}
 
 class Channel extends EventEmitter {
     constructor(ws, options = {}) {
@@ -204,10 +167,6 @@ class Server extends EventEmitter {
         super();
         this.options = {
             port: 8080,
-            tls: false,
-            cert: null,
-            key: null,
-            ca: null,
             externalServer: null,
             perMessageDeflate: true,
             ...options,
@@ -218,37 +177,10 @@ class Server extends EventEmitter {
         this.wss = null;
     }
 
-    _createSecureServer() {
-        let cert, key;
-        if (this.options.cert && this.options.key) {
-            cert = fs.readFileSync(this.options.cert);
-            key = fs.readFileSync(this.options.key);
-        } else {
-            console.warn('No cert/key provided. Generating self-signed certificate...');
-            const selfSigned = createSelfSignedCert();
-            cert = selfSigned.cert;
-            key = selfSigned.key;
-        }
-
-        const options = { cert, key };
-        if (this.options.ca) {
-            options.ca = fs.readFileSync(this.options.ca);
-        }
-
-        return https.createServer(options);
-    }
-
     start() {
         return new Promise((resolve, reject) => {
             try {
-                if (this.options.externalServer) {
-                    this.server = this.options.externalServer;
-                } else if (this.options.tls) {
-                    this.server = this._createSecureServer();
-                } else {
-                    this.server = require('http').createServer();
-                }
-
+                this.server = this.options.externalServer || require('http').createServer();
                 this.wss = new WebSocket.Server({ server: this.server, perMessageDeflate: this.options.perMessageDeflate });
 
                 this.wss.on('connection', (ws, req) => {
@@ -262,15 +194,19 @@ class Server extends EventEmitter {
                     this.emit('connection', channel, req);
                 });
 
-                this.server.listen(this.options.port, () => {
-                    this.emit('listening', this.options.port);
-                    resolve();
-                });
-
                 this.server.on('error', (err) => {
                     this.emit('error', err);
                     reject(err);
                 });
+
+                if (!this.options.externalServer) {
+                    this.server.listen(this.options.port, () => {
+                        this.emit('listening', this.options.port);
+                        resolve();
+                    });
+                } else {
+                    resolve();
+                }
             } catch (error) {
                 reject(error);
             }
@@ -282,7 +218,7 @@ class Server extends EventEmitter {
             if (this.wss) {
                 this.wss.close((err) => {
                     if (err) return reject(err);
-                    if (this.server) {
+                    if (this.server && !this.options.externalServer) {
                         this.server.close((serverErr) => {
                             if (serverErr) return reject(serverErr);
                             resolve();

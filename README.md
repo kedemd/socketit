@@ -30,8 +30,7 @@ npm install socketit
 const { Server } = require('socketit');
 
 const server = new Server({
-    port: 8443,
-    tls: true, // Enable TLS
+    port: 8888,
     routes: {
         echo: async (data) => data, // Async handler to echo back data
         reverse: async (data) => data.split('').reverse().join(''), // Reverse a string
@@ -96,10 +95,7 @@ new Server(options)
 
 **Options**:
 - `port` (number): The port for the WebSocket server. Default is `8080`.
-- `tls` (boolean): Enable TLS. Default is `false`.
-- `cert` (string): Path to the TLS certificate file (optional for self-signed).
-- `key` (string): Path to the TLS private key file (optional for self-signed).
-- `ca` (string): Path to the certificate authority file (optional).
+- `externalServer` (http/https server instance): The server to use. If you need TLS, pass an https server
 - `routes` (object): An object defining methods to handle incoming messages. For example:
   ```javascript
   {

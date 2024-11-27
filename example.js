@@ -3,8 +3,6 @@ const { Server, Client } = require('./socketit');
 // Start a secure WebSocket server
 const server = new Server({
     port: 8443,
-    tls: true, // Enable TLS
-    // No cert/key provided; it will generate self-signed certificates
     routes: {
         hello: async (data) => `Hello, ${data.name || 'World'}!`,
     },
