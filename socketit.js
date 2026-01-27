@@ -194,17 +194,28 @@ class Server extends EventEmitter {
                     this.emit('connection', channel, req);
                 });
 
-                this.server.on('error', (err) => {
-                    this.emit('error', err);
-                    reject(err);
-                });
+                // Startup error handler - only rejects promise, doesn't emit
+                this.server.once('error', reject);
 
                 if (!this.options.externalServer) {
                     this.server.listen(this.options.port, () => {
+                        // Remove startup error handler
+                        this.server.removeListener('error', reject);
+
+                        // Add runtime error handler that emits events
+                        this.server.on('error', (err) => {
+                            this.emit('error', err);
+                        });
+
                         this.emit('listening', this.options.port);
                         resolve();
                     });
                 } else {
+                    // For external servers, remove startup handler and add runtime handler
+                    this.server.removeListener('error', reject);
+                    this.server.on('error', (err) => {
+                        this.emit('error', err);
+                    });
                     resolve();
                 }
             } catch (error) {
