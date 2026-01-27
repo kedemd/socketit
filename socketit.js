@@ -194,16 +194,21 @@ class Server extends EventEmitter {
                     this.emit('connection', channel, req);
                 });
 
-                // Startup error handler - only rejects promise, doesn't emit
+                // Startup error handlers - only reject promise, don't emit
                 this.server.once('error', reject);
+                this.wss.once('error', reject);
 
                 if (!this.options.externalServer) {
                     this.server.listen(this.options.port, () => {
-                        // Remove startup error handler
+                        // Remove startup error handlers
                         this.server.removeListener('error', reject);
+                        this.wss.removeListener('error', reject);
 
-                        // Add runtime error handler that emits events
+                        // Add runtime error handlers that emit events
                         this.server.on('error', (err) => {
+                            this.emit('error', err);
+                        });
+                        this.wss.on('error', (err) => {
                             this.emit('error', err);
                         });
 
@@ -211,9 +216,13 @@ class Server extends EventEmitter {
                         resolve();
                     });
                 } else {
-                    // For external servers, remove startup handler and add runtime handler
+                    // For external servers, remove startup handlers and add runtime handlers
                     this.server.removeListener('error', reject);
+                    this.wss.removeListener('error', reject);
                     this.server.on('error', (err) => {
+                        this.emit('error', err);
+                    });
+                    this.wss.on('error', (err) => {
                         this.emit('error', err);
                     });
                     resolve();

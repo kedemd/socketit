@@ -1,6 +1,6 @@
 {
   "name": "socketit",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "Socketit: A simple and powerful toolkit for WebSocket communication.",
   "main": "socketit.js",
   "scripts": {
