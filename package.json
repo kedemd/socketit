@@ -1,11 +1,19 @@
 {
   "name": "socketit",
-  "version": "2.1.3",
-  "description": "Socketit: A simple and powerful toolkit for WebSocket communication.",
+  "version": "3.0.0",
+  "description": "Simple, production-ready WebSocket request/reply and publish helpers for Node.js.",
   "main": "socketit.js",
+  "types": "socketit.d.ts",
+  "files": [
+    "socketit.js",
+    "README.md",
+    "LICENSE",
+    "socketit.svg"
+  ],
   "scripts": {
-    "start": "echo \"No start script specified\"",
-    "test": "echo \"No test specified\" && exit 1"
+    "example": "node example.js",
+    "test": "node --test --test-concurrency=1",
+    "test:watch": "node --test --test-concurrency=1 --watch"
   },
   "repository": {
     "type": "git",
@@ -17,19 +25,24 @@
     "communication",
     "server",
     "client",
-    "pubsub"
+    "pubsub",
+    "rpc",
+    "request-reply"
   ],
   "author": "Kedem Diamant",
   "license": "MIT",
   "dependencies": {
-    "uuid": "^9.0.0",
-    "ws": "^8.0.0"
+    "uuid": "^11.1.0",
+    "ws": "^8.18.1"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.0.0"
   },
   "bugs": {
     "url": "https://github.com/kedemd/socketit/issues"
   },
-  "homepage": "https://github.com/kedemd/socketit#readme"
+  "homepage": "https://github.com/kedemd/socketit#readme",
+  "publishConfig": {
+    "access": "public"
+  }
 }

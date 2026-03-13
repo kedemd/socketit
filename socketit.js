@@ -1,30 +1,102 @@
-const https = require('https');
-const fs = require('fs');
+const http = require('http');
 const WebSocket = require('ws');
-const { EventEmitter } = require('events');
+const { EventEmitter, once } = require('events');
 const { v4: uuidv4 } = require('uuid');
+
+const DEFAULT_REQUEST_TIMEOUT = 5000;
+
+const MESSAGE_TYPES = {
+    REQUEST: 'request',
+    RESPONSE: 'response',
+    PUBLISH: 'publish',
+};
+
+function normalizeCloseReason(reason) {
+    if (!reason) return '';
+    if (typeof reason === 'string') return reason;
+    if (Buffer.isBuffer(reason)) return reason.toString();
+    return String(reason);
+}
+
+function createErrorMessage(data, fallback = 'Request failed') {
+    if (data && typeof data === 'object' && typeof data.message === 'string' && data.message) {
+        return data.message;
+    }
+
+    if (typeof data === 'string' && data) {
+        return data;
+    }
+
+    return fallback;
+}
+
+function createRpcError(message, code, data) {
+    const err = new Error(message);
+    if (code !== undefined) err.code = code;
+    if (data !== undefined) err.data = data;
+    return err;
+}
+
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getBoundServerPort(server, fallbackPort) {
+    if (!server || typeof server.address !== 'function') {
+        return fallbackPort;
+    }
+
+    const address = server.address();
+    if (address && typeof address === 'object' && typeof address.port === 'number') {
+        return address.port;
+    }
+
+    return fallbackPort;
+}
+
+function isValidSerializedPayload(payload) {
+    return typeof payload === 'string'
+        || Buffer.isBuffer(payload)
+        || payload instanceof ArrayBuffer
+        || ArrayBuffer.isView(payload);
+}
 
 class Channel extends EventEmitter {
     constructor(ws, options = {}) {
         super();
+
         this.ws = ws;
         this.options = {
             routes: {},
+            middleware: [],
+            requestTimeout: DEFAULT_REQUEST_TIMEOUT,
+            maxPayload: 1024 * 1024,
+            serializer: JSON.stringify,
+            deserializer: JSON.parse,
             ...options,
         };
+
         this.routes = {
             ping: async () => 'pong',
             ...this.options.routes,
         };
-        this.pendingRequests = new Map();
-        this._setupWebSocket();
-    }
 
-    _setupWebSocket() {
-        this.ws.on('message', (data) => this._onMessage(data));
-        this.ws.on('close', (code, reason) => this._onClose(code, reason));
-        this.ws.on('error', (error) => this._onError(error));
-        this.ws.on('open', () => this._onOpen());
+        this.middleware = Array.isArray(this.options.middleware)
+            ? [...this.options.middleware]
+            : [];
+
+        this.pendingRequests = new Map();
+
+        this._closed = false;
+        this._openEmitted = false;
+        this._destroyed = false;
+
+        this._boundOnOpen = () => this._onOpen();
+        this._boundOnMessage = (data, isBinary) => this._onMessage(data, isBinary);
+        this._boundOnClose = (code, reason) => this._onClose(code, reason);
+        this._boundOnError = (error) => this._onError(error);
+
+        this._attachSocketListeners();
 
         if (this.isOnline) {
             this._onOpen();
@@ -32,306 +104,718 @@ class Channel extends EventEmitter {
     }
 
     get isOnline() {
-        return this.ws && this.ws.readyState === WebSocket.OPEN;
+        return !!this.ws && this.ws.readyState === WebSocket.OPEN;
+    }
+
+    get isClosed() {
+        return this._closed;
+    }
+
+    setRoute(method, handler) {
+        if (typeof method !== 'string' || !method) {
+            throw new TypeError('method must be a non-empty string');
+        }
+        if (typeof handler !== 'function') {
+            throw new TypeError('handler must be a function');
+        }
+
+        this.routes[method] = handler;
+        return this;
+    }
+
+    removeRoute(method) {
+        delete this.routes[method];
+        return this;
+    }
+
+    use(fn) {
+        if (typeof fn !== 'function') {
+            throw new TypeError('middleware must be a function');
+        }
+        this.middleware.push(fn);
+        return this;
+    }
+
+    _attachSocketListeners() {
+        this.ws.on('open', this._boundOnOpen);
+        this.ws.on('message', this._boundOnMessage);
+        this.ws.on('close', this._boundOnClose);
+        this.ws.on('error', this._boundOnError);
+    }
+
+    _detachSocketListeners() {
+        if (!this.ws) return;
+
+        this.ws.removeListener('open', this._boundOnOpen);
+        this.ws.removeListener('message', this._boundOnMessage);
+        this.ws.removeListener('close', this._boundOnClose);
+        this.ws.removeListener('error', this._boundOnError);
     }
 
     _onOpen() {
+        if (this._closed || this._openEmitted) return;
+        this._openEmitted = true;
         this.emit('connected');
     }
 
-    _onClose(code, reason) {
-        this.ws.removeAllListeners();
-        this.emit('disconnected', code, reason);
-    }
-
     _onError(error) {
-        this.ws.removeAllListeners();
         this.emit('error', error);
     }
 
-    async _onMessage(data) {
-        let message;
-        try {
-            message = JSON.parse(data);
-        } catch (err) {
-            console.error('Failed to parse message:', data);
-            return;
+    _onClose(code, reason) {
+        if (this._closed) return;
+
+        this._closed = true;
+
+        const normalizedReason = normalizeCloseReason(reason);
+        const message = `Socket closed${code ? ` (${code})` : ''}${normalizedReason ? `: ${normalizedReason}` : ''}`;
+
+        this._rejectAllPending(createRpcError(message, 'SOCKET_CLOSED'));
+        this._detachSocketListeners();
+
+        this.emit('disconnected', code, normalizedReason);
+    }
+
+    _rejectAllPending(error) {
+        for (const pending of this.pendingRequests.values()) {
+            if (pending.timer) clearTimeout(pending.timer);
+            if (pending.abortCleanup) pending.abortCleanup();
+            pending.reject(error);
+        }
+        this.pendingRequests.clear();
+    }
+
+    _encode(message) {
+        const payload = this.options.serializer(message);
+
+        if (!isValidSerializedPayload(payload)) {
+            throw new TypeError('serializer must return a string, Buffer, ArrayBuffer, or typed array');
         }
 
-        if (message.type === 'response') {
-            const { ack, code, data } = message;
-            const pending = this.pendingRequests.get(ack);
-            if (pending) {
-                this.pendingRequests.delete(ack);
-                if (code === 200) {
-                    pending.resolve(data);
-                } else {
-                    pending.reject(new Error(data.message || 'Error'));
-                }
-            }
-        } else if (message.type === 'request' || message.type === 'publish') {
-            const { id, method, data } = message;
-            const routeHandler = this.routes[method];
-            if (routeHandler) {
-                try {
-                    const result = await routeHandler(data, this);
-                    if (message.type === 'request') {
-                        this._send({
-                            type: 'response',
-                            ack: id,
-                            code: 200,
-                            data: result,
-                        });
-                    }
-                } catch (err) {
-                    if (message.type === 'request') {
-                        this._send({
-                            type: 'response',
-                            ack: id,
-                            code: 500,
-                            data: { message: err.message },
-                        });
-                    }
-                }
-            } else if (message.type === 'request') {
-                this._send({
-                    type: 'response',
-                    ack: id,
-                    code: 404,
-                    data: { message: `Method '${method}' not found` },
-                });
-            }
-        }
+        return payload;
+    }
+
+    _decode(raw) {
+        const text = Buffer.isBuffer(raw) ? raw.toString() : String(raw);
+        return this.options.deserializer(text);
     }
 
     _send(message) {
-        if (this.isOnline) {
-            this.ws.send(JSON.stringify(message));
-        } else {
-            throw new Error('WebSocket is not open');
+        if (!this.isOnline) {
+            throw createRpcError('WebSocket is not open', 'SOCKET_NOT_OPEN');
+        }
+
+        const payload = this._encode(message);
+        this.ws.send(payload);
+    }
+
+    _safeSend(message) {
+        try {
+            this._send(message);
+            return true;
+        } catch (error) {
+            this.emit('error', error);
+            return false;
         }
     }
 
+    async _onMessage(raw) {
+        let message;
+
+        try {
+            message = this._decode(raw);
+        } catch (error) {
+            this.emit('protocolError', createRpcError('Failed to parse incoming message', 'INVALID_JSON'));
+            return;
+        }
+
+        if (!isPlainObject(message) || typeof message.type !== 'string') {
+            this.emit('protocolError', createRpcError('Received malformed message', 'INVALID_MESSAGE'));
+            return;
+        }
+
+        switch (message.type) {
+            case MESSAGE_TYPES.RESPONSE:
+                this._handleResponse(message);
+                break;
+            case MESSAGE_TYPES.REQUEST:
+                await this._handleIncomingRequest(message);
+                break;
+            case MESSAGE_TYPES.PUBLISH:
+                await this._handleIncomingPublish(message);
+                break;
+            default:
+                this.emit(
+                    'protocolError',
+                    createRpcError(`Unsupported message type '${message.type}'`, 'UNSUPPORTED_MESSAGE_TYPE')
+                );
+        }
+    }
+
+    _handleResponse(message) {
+        const { ack, code, data } = message;
+
+        if (typeof ack !== 'string' || typeof code !== 'number') {
+            this.emit('protocolError', createRpcError('Received malformed response message', 'INVALID_RESPONSE'));
+            return;
+        }
+
+        const pending = this.pendingRequests.get(ack);
+        if (!pending) return;
+
+        this.pendingRequests.delete(ack);
+
+        if (pending.timer) clearTimeout(pending.timer);
+        if (pending.abortCleanup) pending.abortCleanup();
+
+        if (code >= 200 && code < 300) {
+            pending.resolve(data);
+            return;
+        }
+
+        pending.reject(createRpcError(createErrorMessage(data), code, data));
+    }
+
+    async _handleIncomingRequest(message) {
+        const { id, method, data } = message;
+
+        if (typeof id !== 'string' || !id) {
+            this.emit('protocolError', createRpcError('Received request without a valid id', 'INVALID_REQUEST'));
+            return;
+        }
+
+        if (typeof method !== 'string' || !method) {
+            this._safeSend({
+                type: MESSAGE_TYPES.RESPONSE,
+                ack: id,
+                code: 400,
+                data: { message: 'Invalid request method' },
+            });
+            return;
+        }
+
+        try {
+            const result = await this._dispatch({
+                type: MESSAGE_TYPES.REQUEST,
+                id,
+                method,
+                data,
+            });
+
+            this._safeSend({
+                type: MESSAGE_TYPES.RESPONSE,
+                ack: id,
+                code: 200,
+                data: result,
+            });
+        } catch (error) {
+            this._safeSend({
+                type: MESSAGE_TYPES.RESPONSE,
+                ack: id,
+                code: Number.isInteger(error.code) ? error.code : 500,
+                data: {
+                    message: error && error.message ? error.message : 'Internal error',
+                    ...(error && error.data !== undefined ? { details: error.data } : {}),
+                },
+            });
+        }
+    }
+
+    async _handleIncomingPublish(message) {
+        const { method, data } = message;
+
+        if (typeof method !== 'string' || !method) {
+            this.emit('protocolError', createRpcError('Received publish with invalid method', 'INVALID_PUBLISH'));
+            return;
+        }
+
+        try {
+            await this._dispatch({
+                type: MESSAGE_TYPES.PUBLISH,
+                method,
+                data,
+            });
+        } catch (error) {
+            this.emit('error', error);
+        }
+    }
+
+    async _dispatch(ctx) {
+        const handler = this.routes[ctx.method];
+
+        if (!handler) {
+            if (ctx.type === MESSAGE_TYPES.REQUEST) {
+                throw createRpcError(`Method '${ctx.method}' not found`, 404, {
+                    method: ctx.method,
+                });
+            }
+            return undefined;
+        }
+
+        const middlewareStack = [...this.middleware];
+
+        let index = -1;
+
+        const runner = async (i) => {
+            if (i <= index) {
+                throw new Error('next() called multiple times');
+            }
+
+            index = i;
+
+            if (i === middlewareStack.length) {
+                return handler(ctx.data, this, ctx);
+            }
+
+            const fn = middlewareStack[i];
+            return fn(ctx, () => runner(i + 1), this);
+        };
+
+        return runner(0);
+    }
+
     request(method, data, options = {}) {
+        if (typeof method !== 'string' || !method) {
+            return Promise.reject(new TypeError('method must be a non-empty string'));
+        }
+
+        const timeout = Number.isFinite(options.timeout) && options.timeout > 0
+            ? options.timeout
+            : this.options.requestTimeout;
+
+        const signal = options.signal;
         const id = uuidv4();
+
         const message = {
-            type: 'request',
+            type: MESSAGE_TYPES.REQUEST,
             id,
             method,
             data,
         };
 
-        const timeout = options.timeout || 5000;
-        let timer;
-
         return new Promise((resolve, reject) => {
-            this.pendingRequests.set(id, { resolve, reject });
+            if (this._closed) {
+                reject(createRpcError('Channel is closed', 'CHANNEL_CLOSED'));
+                return;
+            }
+
+            if (signal?.aborted) {
+                reject(createRpcError('Request aborted', 'ABORT_ERR'));
+                return;
+            }
+
+            const pending = {
+                resolve,
+                reject,
+                timer: null,
+                abortCleanup: null,
+            };
+
+            this.pendingRequests.set(id, pending);
+
+            if (timeout > 0) {
+                pending.timer = setTimeout(() => {
+                    this.pendingRequests.delete(id);
+                    if (pending.abortCleanup) pending.abortCleanup();
+                    reject(createRpcError(`Request timed out after ${timeout}ms`, 'TIMEOUT'));
+                }, timeout);
+            }
+
+            if (signal) {
+                const onAbort = () => {
+                    this.pendingRequests.delete(id);
+                    if (pending.timer) clearTimeout(pending.timer);
+                    reject(createRpcError('Request aborted', 'ABORT_ERR'));
+                };
+
+                signal.addEventListener('abort', onAbort, { once: true });
+                pending.abortCleanup = () => {
+                    signal.removeEventListener('abort', onAbort);
+                };
+            }
+
             try {
                 this._send(message);
             } catch (error) {
                 this.pendingRequests.delete(id);
-                return reject(error);
+                if (pending.timer) clearTimeout(pending.timer);
+                if (pending.abortCleanup) pending.abortCleanup();
+                reject(error);
             }
-
-            timer = setTimeout(() => {
-                this.pendingRequests.delete(id);
-                reject(new Error(`Request timed out after ${timeout}ms`));
-            }, timeout);
-        }).finally(() => {
-            clearTimeout(timer);
         });
     }
 
     publish(method, data) {
-        const message = {
-            type: 'publish',
+        if (typeof method !== 'string' || !method) {
+            return false;
+        }
+
+        return this._safeSend({
+            type: MESSAGE_TYPES.PUBLISH,
             method,
             data,
-        };
-        try {
-            this._send(message);
-        } catch (error) {
-            console.error('Failed to publish message:', error);
-        }
+        });
     }
 
-    close() {
-        if (this.ws) {
-            this.ws.close();
+    close(code, reason) {
+        if (!this.ws || this._closed) return;
+        this.ws.close(code, reason);
+    }
+
+    terminate() {
+        if (!this.ws || this._closed) return;
+        this.ws.terminate();
+    }
+
+    destroy() {
+        if (this._destroyed) return;
+        this._destroyed = true;
+        this._closed = true;
+
+        this._rejectAllPending(createRpcError('Channel destroyed', 'CHANNEL_DESTROYED'));
+        this._detachSocketListeners();
+
+        if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+            try {
+                this.ws.terminate();
+            } catch (_) {}
         }
+
+        this.ws = null;
+        this.removeAllListeners();
     }
 }
 
 class Server extends EventEmitter {
     constructor(options = {}) {
         super();
+
         this.options = {
             port: 8080,
+            host: undefined,
             externalServer: null,
-            perMessageDeflate: true,
+            routes: {},
+            middleware: [],
+            requestTimeout: DEFAULT_REQUEST_TIMEOUT,
+            serializer: JSON.stringify,
+            deserializer: JSON.parse,
+            maxPayload: 1024 * 1024,
+            perMessageDeflate: false,
+            wsOptions: {},
             ...options,
         };
-        this.routes = { ...this.options.routes };
-        this.channels = new Set();
+
         this.server = null;
         this.wss = null;
+        this.channels = new Set();
+        this.started = false;
     }
 
-    start() {
-        return new Promise((resolve, reject) => {
-            try {
-                this.server = this.options.externalServer || require('http').createServer();
-                this.wss = new WebSocket.Server({ server: this.server, perMessageDeflate: this.options.perMessageDeflate });
+    async start() {
+        if (this.started) {
+            throw new Error('Server has already been started');
+        }
 
-                this.wss.on('connection', (ws, req) => {
-                    const channel = new Channel(ws, { routes: this.routes });
-                    this.channels.add(channel);
+        this.server = this.options.externalServer || http.createServer();
 
-                    channel.on('disconnected', () => {
-                        this.channels.delete(channel);
-                    });
+        const serverOptions = {
+            ...this.options.wsOptions,
+            perMessageDeflate: this.options.perMessageDeflate,
+            maxPayload: this.options.maxPayload,
+            server: this.server,
+        };
 
-                    this.emit('connection', channel, req);
-                });
+        delete serverOptions.port;
+        delete serverOptions.host;
+        delete serverOptions.noServer;
 
-                // Startup error handlers - only reject promise, don't emit
-                this.server.once('error', reject);
-                this.wss.once('error', reject);
+        this.wss = new WebSocket.Server(serverOptions);
 
-                if (!this.options.externalServer) {
-                    this.server.listen(this.options.port, () => {
-                        // Remove startup error handlers
-                        this.server.removeListener('error', reject);
-                        this.wss.removeListener('error', reject);
+        this.wss.on('connection', (ws, req) => {
+            const channel = new Channel(ws, {
+                routes: this.options.routes,
+                middleware: this.options.middleware,
+                serializer: this.options.serializer,
+                deserializer: this.options.deserializer,
+                requestTimeout: this.options.requestTimeout,
+                maxPayload: this.options.maxPayload,
+            });
 
-                        // Add runtime error handlers that emit events
-                        this.server.on('error', (err) => {
-                            this.emit('error', err);
-                        });
-                        this.wss.on('error', (err) => {
-                            this.emit('error', err);
-                        });
+            this.channels.add(channel);
 
-                        this.emit('listening', this.options.port);
-                        resolve();
-                    });
-                } else {
-                    // For external servers, remove startup handlers and add runtime handlers
-                    this.server.removeListener('error', reject);
-                    this.wss.removeListener('error', reject);
-                    this.server.on('error', (err) => {
-                        this.emit('error', err);
-                    });
-                    this.wss.on('error', (err) => {
-                        this.emit('error', err);
-                    });
-                    resolve();
-                }
-            } catch (error) {
-                reject(error);
-            }
+            channel.on('disconnected', () => {
+                this.channels.delete(channel);
+            });
+
+            channel.on('error', (err) => {
+                this.emit('clientError', err, channel, req);
+            });
+
+            channel.on('protocolError', (err) => {
+                this.emit('clientProtocolError', err, channel, req);
+            });
+
+            this.emit('connection', channel, req);
         });
-    }
 
-    stop() {
-        return new Promise((resolve, reject) => {
-            if (this.wss) {
-                this.wss.close((err) => {
-                    if (err) return reject(err);
-                    if (this.server && !this.options.externalServer) {
-                        this.server.close((serverErr) => {
-                            if (serverErr) return reject(serverErr);
-                            resolve();
-                        });
-                    } else {
-                        resolve();
-                    }
-                });
-            } else {
+        this.wss.on('error', (err) => this.emit('error', err));
+
+        if (this.options.externalServer) {
+            this.started = true;
+            this.emit('listening', getBoundServerPort(this.server, this.options.port), this.options.host);
+            return;
+        }
+
+        await new Promise((resolve, reject) => {
+            const onError = (err) => {
+                this.server.removeListener('listening', onListening);
+                reject(err);
+            };
+
+            const onListening = () => {
+                this.server.removeListener('error', onError);
                 resolve();
-            }
+            };
+
+            this.server.once('error', onError);
+            this.server.once('listening', onListening);
+            this.server.listen(this.options.port, this.options.host);
         });
+
+        this.server.on('error', (err) => this.emit('error', err));
+
+        this.started = true;
+        this.emit('listening', getBoundServerPort(this.server, this.options.port), this.options.host);
+    }
+
+    broadcast(method, data) {
+        let count = 0;
+
+        for (const channel of this.channels) {
+            if (channel.publish(method, data)) {
+                count += 1;
+            }
+        }
+
+        return count;
+    }
+
+    async stop() {
+        if (!this.wss) {
+            this.started = false;
+            return;
+        }
+
+        const channels = Array.from(this.channels);
+        const disconnects = channels.map((channel) => {
+            if (channel.isClosed || !channel.ws) {
+                return Promise.resolve();
+            }
+
+            return once(channel, 'disconnected').catch(() => undefined);
+        });
+
+        for (const channel of channels) {
+            channel.close(1001, 'Server shutting down');
+        }
+
+        await new Promise((resolve, reject) => {
+            this.wss.close((err) => (err ? reject(err) : resolve()));
+        });
+
+        await Promise.allSettled(disconnects);
+
+        this.channels.clear();
+        this.wss.removeAllListeners();
+        this.wss = null;
+
+        if (this.server && !this.options.externalServer) {
+            await new Promise((resolve, reject) => {
+                this.server.close((err) => (err ? reject(err) : resolve()));
+            });
+            this.server.removeAllListeners();
+            this.server = null;
+        }
+
+        this.started = false;
     }
 }
 
 class Client extends EventEmitter {
     constructor(url, options = {}) {
         super();
+
         this.url = url;
         this.options = {
             autoReconnect: true,
             reconnectInterval: 5000,
             pingInterval: 10000,
+            requestTimeout: DEFAULT_REQUEST_TIMEOUT,
             routes: {},
+            middleware: [],
+            maxPayload: 1024 * 1024,
+            serializer: JSON.stringify,
+            deserializer: JSON.parse,
             rejectUnauthorized: true,
-            perMessageDeflate: true,
+            perMessageDeflate: false,
+            wsOptions: {},
             ...options,
         };
+
         this.ws = null;
         this.channel = null;
-        this.pingIntervalId = null;
-        this._manualClose = false; // Track if close was called manually
+        this.pingTimer = null;
+        this.reconnectTimer = null;
+
+        this._closedManually = false;
+        this._connecting = false;
+        this._disconnectHandled = false;
+
         this._connect();
     }
 
     _connect() {
+        if (this._connecting) return;
+        this._connecting = true;
+        this._disconnectHandled = false;
+
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
         this.ws = new WebSocket(this.url, {
             rejectUnauthorized: this.options.rejectUnauthorized,
-            perMessageDeflate: this.options.perMessageDeflate
+            perMessageDeflate: this.options.perMessageDeflate,
+            maxPayload: this.options.maxPayload,
+            ...this.options.wsOptions,
         });
 
-        this.ws.on('open', () => {
-            this._manualClose = false;
-            this.channel = new Channel(this.ws, { routes: this.options.routes });
-            this.channel.on('disconnected', () => this._onDisconnected());
-            this.emit('connected', this.channel);
-            if (this.options.pingInterval) {
+        this.ws.once('open', () => {
+            this._connecting = false;
+            this._closedManually = false;
+
+            this.channel = new Channel(this.ws, {
+                routes: this.options.routes,
+                middleware: this.options.middleware,
+                requestTimeout: this.options.requestTimeout,
+                serializer: this.options.serializer,
+                deserializer: this.options.deserializer,
+                maxPayload: this.options.maxPayload,
+            });
+
+            this.channel.on('error', (err) => this.emit('error', err));
+            this.channel.on('protocolError', (err) => this.emit('protocolError', err));
+            this.channel.on('disconnected', (code, reason) => this._handleDisconnect(code, reason));
+
+            if (this.options.pingInterval > 0) {
                 this._startPing();
             }
+
+            this.emit('connected', this.channel);
         });
 
-        this.ws.on('error', (err) => this.emit('error', err));
-        this.ws.on('close', () => this._onDisconnected());
+        this.ws.once('error', (err) => {
+            this._connecting = false;
+            this.emit('error', err);
+        });
+
+        this.ws.once('close', (code, reason) => {
+            this._connecting = false;
+            this._handleDisconnect(code, normalizeCloseReason(reason));
+        });
     }
 
-    _onDisconnected() {
-        if (this.ws) {
-            this.ws.removeAllListeners();
+    _handleDisconnect(code, reason) {
+        if (this._disconnectHandled) return;
+        this._disconnectHandled = true;
+        this._connecting = false;
+
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+            this.pingTimer = null;
         }
 
-        this.emit('disconnected');
-        if (this.pingIntervalId) {
-            clearInterval(this.pingIntervalId);
-            this.pingIntervalId = null;
-        }
+        this.channel = null;
+        this.emit('disconnected', code, reason);
 
-        if (!this._manualClose && this.options.autoReconnect) {
-            setTimeout(() => this._connect(), this.options.reconnectInterval);
+        if (!this._closedManually && this.options.autoReconnect) {
+            this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null;
+                this._connect();
+            }, this.options.reconnectInterval);
         }
     }
 
     _startPing() {
-        if (this.pingIntervalId) {
-            clearInterval(this.pingIntervalId);
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
         }
-        this.pingIntervalId = setInterval(() => {
-            if (this.channel && this.channel.isOnline) {
-                this.channel
-                    .request('ping', null, { timeout: this.options.pingInterval / 2 })
-                    .catch(() => this.ws.close());
-            }
+
+        this.pingTimer = setInterval(() => {
+            if (!this.channel || !this.channel.isOnline) return;
+
+            this.channel
+                .request('ping', null, {
+                    timeout: Math.max(1000, Math.floor(this.options.pingInterval / 2)),
+                })
+                .catch(() => {
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        this.ws.close(1011, 'Ping timeout');
+                    }
+                });
         }, this.options.pingInterval);
     }
 
-    close() {
-        this._manualClose = true; // Indicate manual closure
-        if (this.pingIntervalId) {
-            clearInterval(this.pingIntervalId);
+    close(code = 1000, reason = 'Client closing') {
+        this._closedManually = true;
+        this._connecting = false;
+        this._disconnectHandled = false;
+
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
         }
+
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+            this.pingTimer = null;
+        }
+
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.close(code, reason);
+        } else if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+            this.ws.terminate();
+        } else if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+            queueMicrotask(() => this._handleDisconnect(code, reason));
+        }
+    }
+
+    terminate() {
+        this._closedManually = true;
+        this._connecting = false;
+        this._disconnectHandled = false;
+
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+            this.pingTimer = null;
+        }
+
         if (this.ws) {
-            this.ws.close();
+            this.ws.terminate();
+        } else {
+            queueMicrotask(() => this._handleDisconnect(1006, 'Client terminated'));
         }
     }
 }
 
-module.exports = { Server, Client, Channel };
+module.exports = {
+    Server,
+    Client,
+    Channel,
+};
